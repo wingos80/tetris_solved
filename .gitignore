@@ -1,5 +1,9 @@
-.*
-
-./
-
 __pycache__/
+*.egg-info/
+venv/
+
+# RL artifacts (weights, logs, replays, configs are local)
+rl_training/weights/
+rl_training/logs/
+rl_training/replays/
+rl_training/configs/

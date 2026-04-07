@@ -1,8 +1,18 @@
-"""Human-playable Tetris entry point."""
+"""Human-playable Tetris.
+
+Controls:
+    LEFT / RIGHT    move piece
+    UP              rotate counter-clockwise
+    Z               rotate clockwise
+    DOWN (hold)     soft drop
+    SPACE           hard drop
+    C               hold piece
+    ESC             restart game
+"""
 
 import pygame
-from game import Tetris
-from renderer import TetrisRenderer
+from tetris import Tetris
+from tetris.renderer import TetrisRenderer
 
 FPS = 25
 DROP_EVERY = 6  # frames between automatic drops
