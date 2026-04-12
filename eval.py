@@ -223,14 +223,17 @@ def load_policy(path, algo):
 
 def get_action(policy, obs, algo):
     """Get greedy action from policy."""
-    obs_t = torch.as_tensor(obs["obs"], dtype=torch.float32, device=DEVICE).unsqueeze(0)
-    mask_t = torch.as_tensor(obs["mask"], dtype=torch.bool, device=DEVICE).unsqueeze(0)
+    device = next(policy.parameters()).device
+    obs_t = torch.as_tensor(obs["obs"], dtype=torch.float32, device=device).unsqueeze(0)
+    mask_t = torch.as_tensor(obs["mask"], dtype=torch.bool, device=device).unsqueeze(0)
 
     with torch.no_grad():
         if algo in ("rainbow", "dqn", "qrdqn", "iqn"):
             # DQN-family: use policy forward (handles masking internally)
+            # tianshou's compute_q_value does `1 - mask`, so mask must be numeric
             from tianshou.data import Batch
-            batch = Batch(obs=Batch(obs=obs_t, mask=mask_t), info={})
+            mask_int = mask_t.to(torch.int8)
+            batch = Batch(obs=Batch(obs=obs_t, mask=mask_int), info={})
             result = policy(batch)
             return result.act.item()
         else:
