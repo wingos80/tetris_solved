@@ -74,7 +74,7 @@ class TestQRDQNConfig:
         assert "hidden" in cfg
         assert "num_quantiles" in cfg
         assert "lr" in cfg
-        assert cfg["num_quantiles"] == 200
+        assert cfg["num_quantiles"] == 51
 
     def test_load_override(self, tmp_path):
         override = tmp_path / "override.json"

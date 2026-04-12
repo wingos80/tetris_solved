@@ -20,15 +20,15 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Train Tetris RL agents")
-    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "all"],
+    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn", "all"],
                         default="all", help="Algorithm to train")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override max_epoch (default: algo-specific)")
     parser.add_argument("--config", default=None,
-                        help="Path to JSON hyperparameter config (sac_v2, dqn)")
+                        help="Path to JSON hyperparameter config (sac_v2, dqn, qrdqn, iqn)")
     args = parser.parse_args()
 
-    algos = ["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn"] if args.algo == "all" else [args.algo]
+    algos = ["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn"] if args.algo == "all" else [args.algo]
 
     for algo in algos:
         print(f"\n{'='*50}\nTraining {algo.upper()}\n{'='*50}")
@@ -49,6 +49,9 @@ def main():
             run(max_epoch=args.epochs, config_path=args.config)
         elif algo == "qrdqn":
             from rl_training.qrdqn import main as run
+            run(max_epoch=args.epochs, config_path=args.config)
+        elif algo == "iqn":
+            from rl_training.iqn import main as run
             run(max_epoch=args.epochs, config_path=args.config)
 
 

@@ -100,14 +100,23 @@ def build_sac_policy():
     return policy
 
 
-def build_sac_v2_policy():
+def build_sac_v2_policy(weights_path=None):
     from tianshou.policy import DiscreteSACPolicy
-    from tianshou.utils.net.common import Net
-    from sac_v2 import MaskedSACActor, ObsExtractCritic
+    from sac_v2 import MaskedSACActor, ObsExtractCritic, _make_net
 
-    net_a = Net(state_shape=OBS_N, hidden_sizes=HIDDEN_3, device=DEVICE)
-    net_c1 = Net(state_shape=OBS_N, hidden_sizes=HIDDEN_3, device=DEVICE)
-    net_c2 = Net(state_shape=OBS_N, hidden_sizes=HIDDEN_3, device=DEVICE)
+    # Load config from weights dir if available
+    cfg = {"spectral_norm": False, "layer_norm": False}
+    if weights_path:
+        config_path = Path(weights_path).parent / "config.json"
+        if config_path.exists():
+            import json
+            with open(config_path) as f:
+                cfg.update(json.load(f))
+
+    hidden = cfg.get("hidden", HIDDEN_3)
+    net_a = _make_net(OBS_N, hidden, cfg)
+    net_c1 = _make_net(OBS_N, hidden, cfg)
+    net_c2 = _make_net(OBS_N, hidden, cfg)
     actor = MaskedSACActor(net_a, ACT_N, DEVICE).to(DEVICE)
     critic1 = ObsExtractCritic(net_c1, ACT_N, DEVICE).to(DEVICE)
     critic2 = ObsExtractCritic(net_c2, ACT_N, DEVICE).to(DEVICE)
@@ -134,15 +143,53 @@ def build_dqn_policy():
     return policy
 
 
-def build_qrdqn_policy():
+def build_qrdqn_policy(weights_path=None):
     from tianshou.policy import QRDQNPolicy
     from qrdqn import QRNet
 
-    num_quantiles = 200
+    num_quantiles = 51
+    if weights_path:
+        config_path = Path(weights_path).parent / "config.json"
+        if config_path.exists():
+            import json
+            with open(config_path) as f:
+                num_quantiles = json.load(f).get("num_quantiles", 51)
     net = QRNet(OBS_N, ACT_N, HIDDEN_3, num_quantiles, DEVICE)
     policy = QRDQNPolicy(
         net, torch.optim.Adam(net.parameters()),
         discount_factor=0.99, num_quantiles=num_quantiles,
+        estimation_step=3, target_update_freq=500,
+    ).to(DEVICE)
+    policy.set_eps(0.0)
+    return policy
+
+
+def build_iqn_policy(weights_path=None):
+    from tianshou.policy import IQNPolicy
+    from iqn import ObsExtractNet
+    from tianshou.utils.net.discrete import ImplicitQuantileNetwork
+
+    cfg = {}
+    if weights_path:
+        config_path = Path(weights_path).parent / "config.json"
+        if config_path.exists():
+            import json
+            with open(config_path) as f:
+                cfg = json.load(f)
+
+    preprocess = ObsExtractNet(OBS_N, cfg.get("hidden", HIDDEN_3), DEVICE)
+    net = ImplicitQuantileNetwork(
+        preprocess, ACT_N,
+        num_cosines=int(cfg.get("num_cosines", 64)),
+        preprocess_net_output_dim=preprocess.output_dim,
+        device=DEVICE,
+    )
+    policy = IQNPolicy(
+        net, torch.optim.Adam(net.parameters()),
+        discount_factor=0.99,
+        sample_size=int(cfg.get("sample_size", 32)),
+        online_sample_size=int(cfg.get("online_sample_size", 8)),
+        target_sample_size=int(cfg.get("target_sample_size", 8)),
         estimation_step=3, target_update_freq=500,
     ).to(DEVICE)
     policy.set_eps(0.0)
@@ -156,11 +203,18 @@ BUILDERS = {
     "sac_v2": build_sac_v2_policy,
     "dqn": build_dqn_policy,
     "qrdqn": build_qrdqn_policy,
+    "iqn": build_iqn_policy,
 }
+
+# Builders that accept weights_path kwarg (need config.json for arch detection)
+_PATH_AWARE_BUILDERS = {"sac_v2", "qrdqn", "iqn"}
 
 
 def load_policy(path, algo):
-    policy = BUILDERS[algo]()
+    if algo in _PATH_AWARE_BUILDERS:
+        policy = BUILDERS[algo](weights_path=path)
+    else:
+        policy = BUILDERS[algo]()
     policy.load_state_dict(torch.load(path, map_location=DEVICE))
     policy.to(DEVICE)
     policy.eval()
@@ -173,15 +227,14 @@ def get_action(policy, obs, algo):
     mask_t = torch.as_tensor(obs["mask"], dtype=torch.bool, device=DEVICE).unsqueeze(0)
 
     with torch.no_grad():
-        if algo == "rainbow":
-            # Rainbow: DQN-family, mask must be int8 (tianshou does 1-mask, breaks on bool)
+        if algo in ("rainbow", "dqn", "qrdqn", "iqn"):
+            # DQN-family: use policy forward (handles masking internally)
             from tianshou.data import Batch
-            mask_int = torch.as_tensor(obs["mask"], dtype=torch.int8, device=DEVICE).unsqueeze(0)
-            batch = Batch(obs=Batch(obs=obs_t, mask=mask_int), info={})
+            batch = Batch(obs=Batch(obs=obs_t, mask=mask_t), info={})
             result = policy(batch)
             return result.act.item()
         else:
-            # PPO / SAC: actor outputs logits, take argmax
+            # PPO / SAC / SAC v2: actor outputs logits, take argmax
             class Obs:
                 pass
             o = Obs()
@@ -248,20 +301,27 @@ def run_episode(policy, algo, render=True, save_gif=True, gif_path=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs="?", default=None)
-    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn"], default="ppo")
+    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn"], default="ppo")
     parser.add_argument("--no-gif", action="store_true")
     args = parser.parse_args()
 
-    _weight_names = {
-        "ppo": "best_policy.pth",
-        "rainbow": "best_rainbow.pth",
-        "sac": "best_sac.pth",
-        "sac_v2": "best_sac_v2.pth",
-        "dqn": "best_dqn.pth",
-        "qrdqn": "best_qrdqn.pth",
-    }
     if args.path is None:
-        args.path = str(ROOT / "rl_training" / "weights" / _weight_names[args.algo])
+        # Find the latest timestamped run dir for this algo
+        algo_weights_dir = ROOT / "rl_training" / "weights" / args.algo
+        if algo_weights_dir.is_dir():
+            run_dirs = sorted(
+                [d for d in algo_weights_dir.iterdir()
+                 if d.is_dir() and (d / "best.pth").exists()],
+                key=lambda d: d.name, reverse=True,
+            )
+        else:
+            run_dirs = []
+        if run_dirs:
+            args.path = str(run_dirs[0] / "best.pth")
+            print(f"Using latest weights: {args.path}")
+        else:
+            print(f"No weights found in weights/{args.algo}/ — pass an explicit path.")
+            sys.exit(1)
 
     gif_name = str(ROOT / "rl_training" / "replays" / f"best_{args.algo}.gif")
 

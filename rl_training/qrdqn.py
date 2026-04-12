@@ -179,7 +179,7 @@ def main(max_epoch=None, config_path=None):
     )
     test_collector = Collector(policy, test_envs, exploration_noise=False)
 
-    run_weights_dir = WEIGHTS_DIR / run_name
+    run_weights_dir = WEIGHTS_DIR / "qrdqn" / run_name
     run_weights_dir.mkdir(parents=True, exist_ok=True)
 
     def save_best(policy):

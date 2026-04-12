@@ -76,9 +76,11 @@ class ObsExtractCritic(nn.Module):
 
 
 def main(max_epoch=MAX_EPOCH):
+    from datetime import datetime
     from torch.utils.tensorboard import SummaryWriter
     from tianshou.utils import TensorboardLogger
-    log_dir = WEIGHTS_DIR.parent / "logs" / "sac"
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = WEIGHTS_DIR.parent / "logs" / "sac" / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = TensorboardLogger(SummaryWriter(str(log_dir)))
 
@@ -106,7 +108,7 @@ def main(max_epoch=MAX_EPOCH):
     target_entropy = -np.log(1.0 / act_n) * 0.98  # ~98% of max entropy
     log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
     alpha_optim = torch.optim.Adam([log_alpha], lr=LR_ACTOR)
-    alpha = (ALPHA, log_alpha, alpha_optim)
+    alpha = (target_entropy, log_alpha, alpha_optim)
 
     # ── policy ───────────────────────────────────────────────────
     policy = DiscreteSACPolicy(
@@ -127,17 +129,17 @@ def main(max_epoch=MAX_EPOCH):
     test_collector = Collector(policy, test_envs)
 
     # ── train ────────────────────────────────────────────────────
-    def save_best(policy):
-        WEIGHTS_DIR.mkdir(exist_ok=True)
-        torch.save(policy.state_dict(), WEIGHTS_DIR / "best_sac.pth")
-        print(f"  -> saved rl_training/weights/best_sac.pth")
+    run_weights_dir = WEIGHTS_DIR / "sac" / run_name
+    run_weights_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_dir = WEIGHTS_DIR / "checkpoints"
+    def save_best(policy):
+        path = run_weights_dir / "best.pth"
+        torch.save(policy.state_dict(), path)
+        print(f"  -> saved weights/{run_name}/best.pth")
 
     def save_checkpoint(epoch, env_step, gradient_step):
         if epoch % CHECKPOINT_FREQ == 0:
-            ckpt_dir.mkdir(exist_ok=True)
-            path = ckpt_dir / f"sac_ep{epoch:04d}.pth"
+            path = run_weights_dir / f"ep{epoch:04d}.pth"
             torch.save(policy.state_dict(), path)
             print(f"  -> checkpoint: {path.name}")
 

@@ -35,6 +35,46 @@ NUM_TRAIN = 8
 NUM_TEST = 4
 
 
+# ── networks ────────────────────────────────────────────────────
+
+class PlasticMLP(nn.Module):
+    """MLP with optional spectral norm + layer norm for plasticity.
+
+    Drop-in replacement for tianshou's Net — same interface.
+    """
+
+    def __init__(self, input_dim, hidden_sizes, device,
+                 spectral_norm=False, layer_norm=False):
+        super().__init__()
+        self.output_dim = hidden_sizes[-1]
+        self.device = device
+        layers = []
+        in_dim = input_dim
+        for h in hidden_sizes:
+            linear = nn.Linear(in_dim, h)
+            if spectral_norm:
+                linear = nn.utils.spectral_norm(linear)
+            layers.append(linear)
+            if layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        self.net = nn.Sequential(*layers).to(device)
+
+    def forward(self, obs, state=None, info={}):
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        return self.net(obs), state
+
+
+def _make_net(obs_n, hidden, cfg):
+    """Build backbone: PlasticMLP if spectral/layer norm, else tianshou Net."""
+    if cfg.get("spectral_norm") or cfg.get("layer_norm"):
+        return PlasticMLP(obs_n, hidden, DEVICE,
+                          spectral_norm=cfg.get("spectral_norm", False),
+                          layer_norm=cfg.get("layer_norm", False))
+    return Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
+
+
 # ── wrappers for dict obs ────────────────────────────────────────
 
 class MaskedSACActor(nn.Module):
@@ -85,9 +125,9 @@ def run_trial(cfg: dict, trial_epochs: int) -> float:
     obs_n, act_n = 78, 40
     hidden = cfg["hidden"]
 
-    net_a = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
-    net_c1 = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
-    net_c2 = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
+    net_a = _make_net(obs_n, hidden, cfg)
+    net_c1 = _make_net(obs_n, hidden, cfg)
+    net_c2 = _make_net(obs_n, hidden, cfg)
 
     actor = MaskedSACActor(net_a, act_n, DEVICE).to(DEVICE)
     critic1 = ObsExtractCritic(net_c1, act_n, DEVICE).to(DEVICE)
@@ -100,7 +140,7 @@ def run_trial(cfg: dict, trial_epochs: int) -> float:
     target_entropy = -np.log(1.0 / act_n) * cfg["entropy_frac"]
     log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
     alpha_optim = torch.optim.Adam([log_alpha], lr=cfg["lr_actor"])
-    alpha = (cfg["alpha"], log_alpha, alpha_optim)
+    alpha = (target_entropy, log_alpha, alpha_optim)
 
     policy = DiscreteSACPolicy(
         actor, actor_optim,
@@ -174,9 +214,9 @@ def main(max_epoch=None, config_path=None):
     hidden = cfg["hidden"]
 
     # ── networks ─────────────────────────────────────────────────
-    net_a = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
-    net_c1 = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
-    net_c2 = Net(state_shape=obs_n, hidden_sizes=hidden, device=DEVICE)
+    net_a = _make_net(obs_n, hidden, cfg)
+    net_c1 = _make_net(obs_n, hidden, cfg)
+    net_c2 = _make_net(obs_n, hidden, cfg)
 
     actor = MaskedSACActor(net_a, act_n, DEVICE).to(DEVICE)
     critic1 = ObsExtractCritic(net_c1, act_n, DEVICE).to(DEVICE)
@@ -190,7 +230,7 @@ def main(max_epoch=None, config_path=None):
     target_entropy = -np.log(1.0 / act_n) * cfg["entropy_frac"]
     log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
     alpha_optim = torch.optim.Adam([log_alpha], lr=cfg["lr_actor"])
-    alpha = (cfg["alpha"], log_alpha, alpha_optim)
+    alpha = (target_entropy, log_alpha, alpha_optim)
 
     # ── policy ───────────────────────────────────────────────────
     policy = DiscreteSACPolicy(
@@ -220,7 +260,7 @@ def main(max_epoch=None, config_path=None):
             actor.last.reset_parameters()
             print(f"  -> reset actor head (epoch {epoch})")
 
-    run_weights_dir = WEIGHTS_DIR / run_name
+    run_weights_dir = WEIGHTS_DIR / "sac_v2" / run_name
     run_weights_dir.mkdir(parents=True, exist_ok=True)
 
     def save_best(policy):
