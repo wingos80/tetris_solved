@@ -15,9 +15,8 @@ PYTHON = str(Path(__file__).parent / "venv" / "Scripts" / "python.exe")
 
 # Queue of (algo, epochs, config_path_or_None)
 DEFAULT_QUEUE = [
-    ("sac_v2", 400, "rl_training/configs/sac_v2_plastic_rr03.json"),
-    ("sac_v2", 400, "rl_training/configs/sac_v2_plastic_rr1.json"),
-    ("sac_v2", 400, "rl_training/configs/sac_v2_plastic.json"),
+    ("sac_v2", 400, "rl_training/configs/sac_v2_per_best.json"),
+    ("dqn",    400, "rl_training/configs/dqn_per.json"),
 ]
 
 

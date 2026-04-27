@@ -17,7 +17,7 @@ from pathlib import Path
 WEIGHTS_DIR = Path(__file__).parent / "weights"
 DEFAULT_CONFIG = Path(__file__).parent / "configs" / "dqn_default.json"
 
-from tianshou.data import Collector, VectorReplayBuffer
+from tianshou.data import Collector, PrioritizedVectorReplayBuffer, VectorReplayBuffer
 from tianshou.env import DummyVectorEnv
 from tianshou.policy import DQNPolicy
 from tianshou.trainer import offpolicy_trainer
@@ -92,11 +92,15 @@ def run_trial(cfg: dict, trial_epochs: int) -> float:
     train_envs = DummyVectorEnv([lambda: TetrisEnv() for _ in range(NUM_TRAIN)])
     test_envs = DummyVectorEnv([lambda: TetrisEnv() for _ in range(NUM_TEST)])
 
-    train_collector = Collector(
-        policy, train_envs,
-        VectorReplayBuffer(int(cfg["buffer_size"]), NUM_TRAIN),
-        exploration_noise=True,
-    )
+    per_alpha = cfg.get("per_alpha", 0.0)
+    if per_alpha > 0:
+        buf = PrioritizedVectorReplayBuffer(
+            int(cfg["buffer_size"]), NUM_TRAIN,
+            alpha=per_alpha, beta=cfg.get("per_beta", 0.4),
+        )
+    else:
+        buf = VectorReplayBuffer(int(cfg["buffer_size"]), NUM_TRAIN)
+    train_collector = Collector(policy, train_envs, buf, exploration_noise=True)
     test_collector = Collector(policy, test_envs, exploration_noise=False)
 
     reset_freq = int(cfg.get("reset_freq", 0))
@@ -163,11 +167,15 @@ def main(max_epoch=None, config_path=None):
         is_double=True,
     ).to(DEVICE)
 
-    train_collector = Collector(
-        policy, train_envs,
-        VectorReplayBuffer(int(cfg["buffer_size"]), NUM_TRAIN),
-        exploration_noise=True,
-    )
+    per_alpha = cfg.get("per_alpha", 0.0)
+    if per_alpha > 0:
+        buf = PrioritizedVectorReplayBuffer(
+            int(cfg["buffer_size"]), NUM_TRAIN,
+            alpha=per_alpha, beta=cfg.get("per_beta", 0.4),
+        )
+    else:
+        buf = VectorReplayBuffer(int(cfg["buffer_size"]), NUM_TRAIN)
+    train_collector = Collector(policy, train_envs, buf, exploration_noise=True)
     test_collector = Collector(policy, test_envs, exploration_noise=False)
 
     run_weights_dir = WEIGHTS_DIR / "dqn" / run_name

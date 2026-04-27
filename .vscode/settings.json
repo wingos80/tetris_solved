@@ -1,0 +1,5 @@
+{
+    "python.defaultInterpreterPath": "c:\\Users\\micky\\Desktop\\wings_stuff\\coding\\my_stuff\\random_projs\\tetris\\venv\\Scripts\\python.exe",
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip"
+}
