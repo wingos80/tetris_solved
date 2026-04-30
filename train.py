@@ -20,7 +20,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Train Tetris RL agents")
-    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn", "afterstate", "all"],
+    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn", "afterstate", "afterstate_qrdqn", "afterstate_cnn", "afterstate_spr", "muzero_afterstate", "all"],
                         default="all", help="Algorithm to train")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override max_epoch (default: algo-specific)")
@@ -28,7 +28,7 @@ def main():
                         help="Path to JSON hyperparameter config (sac_v2, dqn, qrdqn, iqn)")
     args = parser.parse_args()
 
-    algos = ["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn", "afterstate"] if args.algo == "all" else [args.algo]
+    algos = ["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn", "afterstate", "afterstate_qrdqn", "afterstate_cnn", "afterstate_spr", "muzero_afterstate"] if args.algo == "all" else [args.algo]
 
     for algo in algos:
         print(f"\n{'='*50}\nTraining {algo.upper()}\n{'='*50}")
@@ -55,6 +55,18 @@ def main():
             run(max_epoch=args.epochs, config_path=args.config)
         elif algo == "afterstate":
             from rl_training.afterstate_dqn import main as run
+            run(max_epoch=args.epochs, config_path=args.config)
+        elif algo == "afterstate_qrdqn":
+            from rl_training.afterstate_qrdqn import main as run
+            run(max_epoch=args.epochs, config_path=args.config)
+        elif algo == "afterstate_cnn":
+            from rl_training.afterstate_cnn import main as run
+            run(max_epoch=args.epochs, config_path=args.config)
+        elif algo == "afterstate_spr":
+            from rl_training.afterstate_spr import main as run
+            run(max_epoch=args.epochs, config_path=args.config)
+        elif algo == "muzero_afterstate":
+            from rl_training.muzero_afterstate import main as run
             run(max_epoch=args.epochs, config_path=args.config)
 
 
