@@ -1,50 +1,53 @@
-"""Evaluate a trained Tetris RL policy — render with pygame and save a GIF.
+"""Evaluate a trained Tetris RL policy — render, GIF, and/or benchmark stats.
 
-Loads saved weights from rl_training/weights/, runs one episode, and saves
-an animated GIF to rl_training/replays/best_{algo}.gif.
+Supports all algos (tianshou-based and afterstate variants).
 
-Supported algos and their weight files:
-    ppo     → rl_training/weights/best_policy.pth
-    rainbow → rl_training/weights/best_rainbow.pth
-    sac     → rl_training/weights/best_sac.pth
-    sac_v2  → rl_training/weights/best_sac_v2.pth
-    dqn     → rl_training/weights/best_dqn.pth
+Single-episode mode (default):  renders live + saves a GIF.
+Benchmark mode (--episodes N):  runs N greedy episodes, prints mean±std stats.
 
 Usage:
-    python eval.py                               # defaults: ppo
-    python eval.py --algo rainbow
-    python eval.py --algo sac
-    python eval.py --algo sac_v2
-    python eval.py --algo dqn
-    python eval.py rl_training/weights/best_policy.pth --algo ppo --no-gif
+    python eval.py --algo afterstate_qrdqn                 # render 1 ep, save GIF
+    python eval.py --algo afterstate_qrdqn --no-gif        # render only
+    python eval.py --algo afterstate_qrdqn --episodes 30   # 30-ep benchmark, no render
+    python eval.py --algo sac_v2 --episodes 30             # benchmark any algo
+    python eval.py path/to/best.pth --algo ppo             # explicit weights
 
 Flags:
-    path        Optional explicit path to .pth weights file
-    --algo      Algorithm architecture to load (required to build correct network)
-    --no-gif    Skip saving the GIF (render only)
+    path            Optional explicit path to .pth file
+    --algo          Algorithm (required for correct network architecture)
+    --episodes N    Episodes to run; default 1 (renders). N>1 disables render/GIF.
+    --render        Force rendering even in benchmark mode
+    --no-gif        Skip saving GIF in single-episode mode
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-sys.path.insert(0, str(ROOT / "rl_training"))  # allow 'from ppo import ...' etc.
+sys.path.insert(0, str(ROOT / "rl_training"))
 
-import torch
 import numpy as np
-import pygame
-from PIL import Image
+import torch
 
 from tetris.env import TetrisEnv
-from tetris.renderer import TetrisRenderer
+from tetris.env.afterstate import (
+    apply_action,
+    enumerate_afterstates,
+    enumerate_afterstates_raw,
+    nuno_reward,
+)
+from tetris.game import Tetris
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HIDDEN_2 = [256, 256]
 HIDDEN_3 = [256, 256, 256]
 OBS_N, ACT_N = 78, 40
 
+
+# ── tianshou policy builders ──────────────────────────────────────
 
 def build_ppo_policy():
     from tianshou.policy import PPOPolicy
@@ -104,12 +107,10 @@ def build_sac_v2_policy(weights_path=None):
     from tianshou.policy import DiscreteSACPolicy
     from sac_v2 import MaskedSACActor, ObsExtractCritic, _make_net
 
-    # Load config from weights dir if available
     cfg = {"spectral_norm": False, "layer_norm": False}
     if weights_path:
         config_path = Path(weights_path).parent / "config.json"
         if config_path.exists():
-            import json
             with open(config_path) as f:
                 cfg.update(json.load(f))
 
@@ -151,7 +152,6 @@ def build_qrdqn_policy(weights_path=None):
     if weights_path:
         config_path = Path(weights_path).parent / "config.json"
         if config_path.exists():
-            import json
             with open(config_path) as f:
                 num_quantiles = json.load(f).get("num_quantiles", 51)
     net = QRNet(OBS_N, ACT_N, HIDDEN_3, num_quantiles, DEVICE)
@@ -173,7 +173,6 @@ def build_iqn_policy(weights_path=None):
     if weights_path:
         config_path = Path(weights_path).parent / "config.json"
         if config_path.exists():
-            import json
             with open(config_path) as f:
                 cfg = json.load(f)
 
@@ -206,8 +205,23 @@ BUILDERS = {
     "iqn": build_iqn_policy,
 }
 
-# Builders that accept weights_path kwarg (need config.json for arch detection)
 _PATH_AWARE_BUILDERS = {"sac_v2", "qrdqn", "iqn"}
+
+AFTERSTATE_ALGOS = {"afterstate", "afterstate_qrdqn", "afterstate_cnn", "afterstate_spr", "muzero_afterstate"}
+MCTS_ELIGIBLE = {"afterstate", "afterstate_qrdqn"}  # 4-feature V-nets only
+
+
+# ── helpers ───────────────────────────────────────────────────────
+
+def _latest_weights(algo):
+    algo_dir = ROOT / "rl_training" / "weights" / algo
+    if not algo_dir.is_dir():
+        return None
+    runs = sorted(
+        [d for d in algo_dir.iterdir() if d.is_dir() and (d / "best.pth").exists()],
+        key=lambda d: d.name, reverse=True,
+    )
+    return str(runs[0] / "best.pth") if runs else None
 
 
 def load_policy(path, algo):
@@ -216,28 +230,23 @@ def load_policy(path, algo):
     else:
         policy = BUILDERS[algo]()
     policy.load_state_dict(torch.load(path, map_location=DEVICE))
-    policy.to(DEVICE)
-    policy.eval()
+    policy.to(DEVICE).eval()
     return policy
 
 
 def get_action(policy, obs, algo):
-    """Get greedy action from policy."""
     device = next(policy.parameters()).device
     obs_t = torch.as_tensor(obs["obs"], dtype=torch.float32, device=device).unsqueeze(0)
     mask_t = torch.as_tensor(obs["mask"], dtype=torch.bool, device=device).unsqueeze(0)
 
     with torch.no_grad():
         if algo in ("rainbow", "dqn", "qrdqn", "iqn"):
-            # DQN-family: use policy forward (handles masking internally)
-            # tianshou's compute_q_value does `1 - mask`, so mask must be numeric
             from tianshou.data import Batch
             mask_int = mask_t.to(torch.int8)
             batch = Batch(obs=Batch(obs=obs_t, mask=mask_int), info={})
             result = policy(batch)
             return result.act.item()
         else:
-            # PPO / SAC / SAC v2: actor outputs logits, take argmax
             class Obs:
                 pass
             o = Obs()
@@ -247,9 +256,52 @@ def get_action(policy, obs, algo):
             return logits.argmax(dim=-1).item()
 
 
-def run_episode(policy, algo, render=True, save_gif=True, gif_path=None):
-    if gif_path is None:
-        gif_path = str(ROOT / "rl_training" / "replays" / "best.gif")
+def _load_afterstate_net(path, algo):
+    """Return (net, score_fn, enumerator) for an afterstate algo."""
+    cfg_path = Path(path).parent / "config.json"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if algo == "afterstate_qrdqn":
+        from rl_training.afterstate_qrdqn import QuantileVNet
+        net = QuantileVNet(cfg["hidden"], cfg["n_quantiles"], DEVICE)
+        score_fn = lambda x: net.value(x).cpu().numpy()
+        enumerator = enumerate_afterstates
+    elif algo == "afterstate_cnn":
+        from rl_training.afterstate_cnn import BoardVNet
+        net = BoardVNet(cfg["conv_channels"], cfg["fc_hidden"], DEVICE)
+        score_fn = lambda x: net(x).cpu().numpy()
+        enumerator = enumerate_afterstates_raw
+    elif algo == "afterstate_spr":
+        from rl_training.afterstate_spr import SPRNet
+        net = SPRNet(cfg["conv_channels"], cfg["fc_hidden"],
+                     cfg["latent_dim"], cfg["action_emb_dim"], DEVICE)
+        score_fn = lambda x: net(x).cpu().numpy()
+        enumerator = enumerate_afterstates_raw
+    elif algo == "muzero_afterstate":
+        from rl_training.muzero_afterstate import MuZeroNet
+        net = MuZeroNet(cfg["conv_channels"], cfg["fc_hidden"],
+                        cfg["latent_dim"], cfg["action_emb_dim"],
+                        cfg["n_quantiles"], DEVICE)
+        score_fn = lambda x: net(x).cpu().numpy()
+        enumerator = enumerate_afterstates_raw
+    else:
+        from rl_training.afterstate_dqn import VNet
+        net = VNet(cfg["hidden"], DEVICE)
+        score_fn = lambda x: net(x).cpu().numpy()
+        enumerator = enumerate_afterstates
+    net.load_state_dict(torch.load(path, map_location=DEVICE))
+    net.eval()
+    return net, score_fn, enumerator
+
+
+# ── episode runners ───────────────────────────────────────────────
+
+def _run_tianshou_episode(policy, algo, render, save_gif, gif_path):
+    """One episode with a tianshou policy. Returns (reward, lines, placements)."""
+    import pygame
+    from PIL import Image
+    from tetris.renderer import TetrisRenderer
+
     env = TetrisEnv()
     obs, _ = env.reset()
     game = env.game
@@ -260,74 +312,269 @@ def run_episode(policy, algo, render=True, save_gif=True, gif_path=None):
 
     frames = []
     clock = pygame.time.Clock() if render else None
-    total_reward = 0
-    steps = 0
+    ep_reward, ep_lines, ep_placements = 0.0, 0, 0
 
     while True:
         action = get_action(policy, obs, algo)
         obs, reward, term, trunc, info = env.step(action)
-        total_reward += reward
-        steps += 1
+        ep_reward += reward
+        if info.get("valid", False):
+            ep_placements += 1
+            ep_lines += info.get("lines", 0)
 
         if render:
             renderer.draw()
             pygame.display.flip()
             clock.tick(5)
-
             if save_gif:
                 data = pygame.image.tostring(renderer.screen, "RGB")
                 w, h = renderer.screen.get_size()
                 frames.append(Image.frombytes("RGB", (w, h), data))
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
 
-        if term:
+        if term or trunc or ep_placements > 5000:
             break
 
     if save_gif and frames:
         os.makedirs(os.path.dirname(gif_path) or ".", exist_ok=True)
         frames[0].save(gif_path, save_all=True, append_images=frames[1:],
                        duration=200, loop=0)
-        print(f"Saved GIF to {gif_path} ({len(frames)} frames)")
+        print(f"Saved GIF → {gif_path} ({len(frames)} frames)")
 
     if render:
         pygame.quit()
 
-    print(f"Episode: algo={algo}, score={info.get('score', 0)}, "
-          f"reward={total_reward:.2f}, steps={steps}")
-    return total_reward
+    return ep_reward, ep_lines, ep_placements
 
+
+def _run_afterstate_episode(score_fn, enumerator, render, save_gif, gif_path):
+    """One episode with an afterstate net. Returns (reward, lines, placements)."""
+    import pygame
+    from PIL import Image
+    from tetris.renderer import TetrisRenderer
+
+    game = Tetris()
+    game.next_block()
+
+    if render:
+        pygame.init()
+        renderer = TetrisRenderer(game)
+
+    frames = []
+    clock = pygame.time.Clock() if render else None
+    ep_reward, ep_lines, ep_placements = 0.0, 0, 0
+
+    while game.state != "gameover":
+        afterstates = enumerator(game)
+        if not afterstates:
+            break
+        actions = list(afterstates.keys())
+        feats = np.stack([afterstates[a][0] for a in actions])
+        with torch.no_grad():
+            values = score_fn(feats)
+        action = actions[int(np.argmax(values))]
+        lines, done = apply_action(game, action)
+        ep_reward += nuno_reward(lines, done)
+        ep_lines += lines
+        ep_placements += 1
+
+        if render:
+            renderer.draw()
+            pygame.display.flip()
+            clock.tick(5)
+            if save_gif:
+                data = pygame.image.tostring(renderer.screen, "RGB")
+                w, h = renderer.screen.get_size()
+                frames.append(Image.frombytes("RGB", (w, h), data))
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+
+        if done or ep_placements > 5000:
+            break
+
+    if save_gif and frames:
+        os.makedirs(os.path.dirname(gif_path) or ".", exist_ok=True)
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:],
+                       duration=200, loop=0)
+        print(f"Saved GIF → {gif_path} ({len(frames)} frames)")
+
+    if render:
+        pygame.quit()
+
+    return ep_reward, ep_lines, ep_placements
+
+
+def _run_mcts_episode(net_value_fn, depth, gamma, render, save_gif, gif_path):
+    """One episode using MCTS expectimax. Returns (reward, lines, placements)."""
+    from rl_training.mcts import mcts_action
+    import pygame
+    from PIL import Image
+    from tetris.renderer import TetrisRenderer
+
+    game = Tetris()
+    game.next_block()
+
+    if render:
+        pygame.init()
+        renderer = TetrisRenderer(game)
+
+    frames = []
+    clock = pygame.time.Clock() if render else None
+    ep_reward, ep_lines, ep_placements = 0.0, 0, 0
+
+    while game.state != "gameover":
+        action, _ = mcts_action(game, net_value_fn, depth=depth, gamma=gamma)
+        if action is None:
+            break
+        lines, done = apply_action(game, action)
+        ep_reward += nuno_reward(lines, done)
+        ep_lines += lines
+        ep_placements += 1
+
+        if render:
+            renderer.draw()
+            pygame.display.flip()
+            clock.tick(5)
+            if save_gif:
+                data = pygame.image.tostring(renderer.screen, "RGB")
+                w, h = renderer.screen.get_size()
+                frames.append(Image.frombytes("RGB", (w, h), data))
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+
+        if done or ep_placements > 5000:
+            break
+
+    if save_gif and frames:
+        os.makedirs(os.path.dirname(gif_path) or ".", exist_ok=True)
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:],
+                       duration=200, loop=0)
+        print(f"Saved GIF → {gif_path} ({len(frames)} frames)")
+
+    if render:
+        pygame.quit()
+
+    return ep_reward, ep_lines, ep_placements
+
+
+# ── benchmark helpers (kept for test compatibility) ───────────────
+
+def eval_tianshou_agent(path, algo, episodes):
+    """N greedy episodes for a tianshou policy. Returns (rewards, lines, placements)."""
+    policy = load_policy(path, algo)
+    rewards, lines_list, placements = [], [], []
+    for _ in range(episodes):
+        r, l, p = _run_tianshou_episode(policy, algo, render=False, save_gif=False, gif_path=None)
+        rewards.append(r)
+        lines_list.append(l)
+        placements.append(p)
+    return rewards, lines_list, placements
+
+
+def eval_afterstate_agent(path, episodes, algo="afterstate"):
+    """N greedy episodes for an afterstate net. Returns (rewards, lines, placements)."""
+    _, score_fn, enumerator = _load_afterstate_net(path, algo)
+    rewards, lines_list, placements = [], [], []
+    for _ in range(episodes):
+        r, l, p = _run_afterstate_episode(score_fn, enumerator, render=False, save_gif=False, gif_path=None)
+        rewards.append(r)
+        lines_list.append(l)
+        placements.append(p)
+    return rewards, lines_list, placements
+
+
+# ── main ──────────────────────────────────────────────────────────
+
+ALL_ALGOS = list(BUILDERS) + list(AFTERSTATE_ALGOS) + ["mcts"]
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("path", nargs="?", default=None)
-    parser.add_argument("--algo", choices=["ppo", "rainbow", "sac", "sac_v2", "dqn", "qrdqn", "iqn"], default="ppo")
-    parser.add_argument("--no-gif", action="store_true")
+    parser = argparse.ArgumentParser(description="Evaluate a Tetris RL policy")
+    parser.add_argument("path", nargs="?", default=None,
+                        help="Path to .pth weights file (default: latest for --algo)")
+    parser.add_argument("--algo", choices=ALL_ALGOS, default="ppo")
+    parser.add_argument("--episodes", type=int, default=1,
+                        help="Episodes to run (default 1 = render+GIF; >1 = benchmark)")
+    parser.add_argument("--render", action="store_true",
+                        help="Force rendering even in benchmark mode")
+    parser.add_argument("--no-gif", action="store_true",
+                        help="Skip saving GIF in single-episode mode")
+    parser.add_argument("--mcts-base", choices=list(MCTS_ELIGIBLE), default="afterstate_qrdqn",
+                        help="V-net to use as MCTS leaf evaluator (default: afterstate_qrdqn)")
+    parser.add_argument("--mcts-depth", type=int, default=1,
+                        help="MCTS expectimax depth (default: 1)")
+    parser.add_argument("--gamma", type=float, default=0.95,
+                        help="Discount for MCTS backup (default: 0.95)")
     args = parser.parse_args()
 
+    algo_for_weights = args.mcts_base if args.algo == "mcts" else args.algo
+
     if args.path is None:
-        # Find the latest timestamped run dir for this algo
-        algo_weights_dir = ROOT / "rl_training" / "weights" / args.algo
-        if algo_weights_dir.is_dir():
-            run_dirs = sorted(
-                [d for d in algo_weights_dir.iterdir()
-                 if d.is_dir() and (d / "best.pth").exists()],
-                key=lambda d: d.name, reverse=True,
-            )
-        else:
-            run_dirs = []
-        if run_dirs:
-            args.path = str(run_dirs[0] / "best.pth")
-            print(f"Using latest weights: {args.path}")
-        else:
-            print(f"No weights found in weights/{args.algo}/ — pass an explicit path.")
+        args.path = _latest_weights(algo_for_weights)
+        if args.path is None:
+            print(f"No weights found for {algo_for_weights}. Pass an explicit path.")
             sys.exit(1)
+        print(f"Using latest weights: {args.path}")
 
-    gif_name = str(ROOT / "rl_training" / "replays" / f"best_{args.algo}.gif")
+    render = (args.episodes == 1) or args.render
+    save_gif = render and (args.episodes == 1) and not args.no_gif
+    gif_path = str(ROOT / "rl_training" / "replays" / f"best_{args.algo}.gif")
 
-    policy = load_policy(args.path, args.algo)
-    run_episode(policy, args.algo, render=True,
-                save_gif=not args.no_gif, gif_path=gif_name)
+    rewards, lines_list, placements = [], [], []
+
+    if args.algo == "mcts":
+        _, net_value_fn, _ = _load_afterstate_net(args.path, args.mcts_base)
+        # Wrap score_fn to match mcts_action's expected signature: (features [N,4]) -> [N]
+        def _value_fn(x):
+            with torch.no_grad():
+                return net_value_fn(x)
+        label = f"mcts(depth={args.mcts_depth}, base={args.mcts_base})"
+        print(f"MCTS: depth={args.mcts_depth}, base={args.mcts_base}, gamma={args.gamma}")
+        for ep in range(args.episodes):
+            r, l, p = _run_mcts_episode(
+                _value_fn, depth=args.mcts_depth, gamma=args.gamma,
+                render=render and (ep == 0 or args.render),
+                save_gif=save_gif and ep == 0,
+                gif_path=gif_path,
+            )
+            rewards.append(r); lines_list.append(l); placements.append(p)
+            print(f"ep {ep+1}/{args.episodes} | reward={r:.2f}  lines={l}  placements={p}")
+    elif args.algo in AFTERSTATE_ALGOS:
+        _, score_fn, enumerator = _load_afterstate_net(args.path, args.algo)
+        for ep in range(args.episodes):
+            r, l, p = _run_afterstate_episode(
+                score_fn, enumerator,
+                render=render and (ep == 0 or args.render),
+                save_gif=save_gif and ep == 0,
+                gif_path=gif_path,
+            )
+            rewards.append(r); lines_list.append(l); placements.append(p)
+            print(f"ep {ep+1}/{args.episodes} | reward={r:.2f}  lines={l}  placements={p}")
+    else:
+        policy = load_policy(args.path, args.algo)
+        for ep in range(args.episodes):
+            r, l, p = _run_tianshou_episode(
+                policy, args.algo,
+                render=render and (ep == 0 or args.render),
+                save_gif=save_gif and ep == 0,
+                gif_path=gif_path,
+            )
+            rewards.append(r); lines_list.append(l); placements.append(p)
+            print(f"ep {ep+1}/{args.episodes} | reward={r:.2f}  lines={l}  placements={p}")
+
+    if args.episodes > 1:
+        r = np.array(rewards); l = np.array(lines_list); p = np.array(placements)
+        display_algo = f"mcts(d={args.mcts_depth},{args.mcts_base})" if args.algo == "mcts" else args.algo
+        print(f"\n{'='*50}")
+        print(f"Algo: {display_algo}  |  Weights: {args.path}")
+        print(f"Episodes: {args.episodes}")
+        print(f"{'='*50}")
+        print(f"Reward:     {r.mean():>8.2f} ± {r.std():.2f}   [min {r.min():.2f}, max {r.max():.2f}]")
+        print(f"Lines:      {l.mean():>8.2f} ± {l.std():.2f}   [min {l.min()}, max {l.max()}]")
+        print(f"Placements: {p.mean():>8.2f} ± {p.std():.2f}   [min {p.min()}, max {p.max()}]")
