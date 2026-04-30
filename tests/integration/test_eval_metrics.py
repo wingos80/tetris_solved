@@ -4,8 +4,12 @@ error on freshly-built (untrained) policies for every algo."""
 import pytest
 import torch
 
-from eval_metrics import eval_afterstate_agent, eval_tianshou_agent
-from eval import BUILDERS, _PATH_AWARE_BUILDERS
+from eval import (
+    BUILDERS,
+    _PATH_AWARE_BUILDERS,
+    eval_afterstate_agent,
+    eval_tianshou_agent,
+)
 
 
 @pytest.mark.parametrize("algo", ["ppo", "rainbow", "sac", "dqn"])
