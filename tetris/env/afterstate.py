@@ -96,6 +96,32 @@ def enumerate_afterstates(game):
     return out
 
 
+def enumerate_afterstates_raw(game):
+    """Like enumerate_afterstates, but returns the post-placement binary board
+    (shape [ROWS, COLS], float32, 0/1) instead of the 4-feature vector.
+
+    Used by raw-board agents (Stage 4 Branch A). Additive to enumerate_afterstates
+    — both share the same _simulate_placement core, so the 4-feature path is
+    untouched.
+
+    Returns: dict {(rotation, x): (board_2d_float32, lines_cleared)}
+    """
+    out = {}
+    block = game.block
+    if block is None or game.state == "gameover":
+        return out
+    C = Tetris.COLS
+    for rot in range(block.num_rotations):
+        for x in range(-3, C):
+            sim = _simulate_placement(game, rot, x)
+            if sim is None:
+                continue
+            field_after, lines, _ = sim
+            board = (np.asarray(field_after, dtype=np.float32) > 0).astype(np.float32)
+            out[(rot, x)] = (board, lines)
+    return out
+
+
 def apply_action(game, action):
     """Apply a placement action (rot, x) tuple to the real game.
 
